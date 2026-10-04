@@ -1,11 +1,30 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
+/** 供稿线路：主路 / 备路。 */
+export type FeedLine = 'primary' | 'backup';
+
+/** 线路回传的原始包：只携带线路、时间窗与原文。 */
+export interface FeedPacket {
+  id: string;
+  line: FeedLine;
+  startTime: number;
+  endTime: number;
+  text: string;
+}
+
+/** 同一次发言的另一线路版本，并列待选。 */
+export interface CaptionVariant {
+  line: FeedLine;
+  text: string;
+  receivedAt: number;
+}
 
 export interface CaptionSegment {
   id: string;
   sequence: number;
   startTime: number;
+  endTime: number;
   receivedAt: number;
   confirmedAt?: number;
   speaker: string;
@@ -13,11 +32,17 @@ export interface CaptionSegment {
   corrected: string;
   numberHints: string;
   source: SegmentSource;
+  /** 当前采用文本来自哪条线路。 */
+  line: FeedLine;
   state: SegmentState;
   duplicateOf?: string;
   staleReason?: string;
   revision: number;
   tags: string[];
+  /** 另一线路覆盖同一次发言时留下的待选版本。 */
+  variants: CaptionVariant[];
+  /** 已对账进本片段的回传包 id，重试时用于幂等跳过。 */
+  packetIds: string[];
 }
 
 export interface TermRule {
@@ -29,6 +54,26 @@ export interface TermRule {
   caseSensitive: boolean;
   usageCount: number;
   createdAt: number;
+}
+
+/** 备路回传包：一组只含线路、时间窗与原文的包。 */
+export interface BackhaulPackage {
+  id: string;
+  createdAt: number;
+  packets: FeedPacket[];
+}
+
+/** 回传包导入检查点：失败后从这里续传，重试不重复生成。 */
+export interface BackhaulCheckpoint {
+  packageId: string;
+  nextIndex: number;
+  total: number;
+  imported: number;
+  merged: number;
+  skipped: number;
+  status: 'interrupted' | 'done';
+  error?: string;
+  updatedAt: number;
 }
 
 export interface DeskModel {
@@ -43,6 +88,8 @@ export interface DeskModel {
   nextSequence: number;
   autoStream: boolean;
   lastMergedAt?: number;
+  backhaul?: BackhaulCheckpoint;
+  backhaulPackage?: BackhaulPackage;
   updatedAt: number;
 }
 
@@ -69,6 +116,7 @@ function segment(
     id,
     sequence,
     startTime,
+    endTime: startTime + 7,
     receivedAt: now - (100 - sequence) * 8_000,
     confirmedAt: state === 'confirmed' ? now - (100 - sequence) * 7_000 : undefined,
     speaker,
@@ -76,9 +124,12 @@ function segment(
     corrected,
     numberHints: '',
     source: 'live',
+    line: 'primary',
     state,
     revision: 0,
     tags: [],
+    variants: [],
+    packetIds: [`seed-${id}`],
   };
 }
 
@@ -117,6 +168,21 @@ export function createInitialModel(): DeskModel {
     autoStream: true,
     updatedAt: now,
   };
+}
+
+/** 旧草稿没有线路信息：按主路兼容打开，并补齐对账所需字段。 */
+export function migrateModel(model: DeskModel): DeskModel {
+  const segments = (model.segments ?? []).map((item) => {
+    const legacy = item as Partial<CaptionSegment> & CaptionSegment;
+    return {
+      ...item,
+      line: legacy.line ?? 'primary',
+      endTime: legacy.endTime ?? item.startTime + 7,
+      variants: legacy.variants ?? [],
+      packetIds: legacy.packetIds ?? [],
+    };
+  });
+  return { ...model, segments };
 }
 
 export function cloneModel(model: DeskModel): DeskModel {
@@ -180,15 +246,179 @@ export function applyRules(text: string, model: DeskModel): { text: string; used
   return { text: normalizePunctuation(next), used };
 }
 
+const normalizeText = (value: string) => value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
+
 export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[]): CaptionSegment | undefined {
-  const normalize = (value: string) => value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
-  const candidateText = normalize(candidate.corrected || candidate.original);
+  const candidateText = normalizeText(candidate.corrected || candidate.original);
   return existing.find((segmentItem) => {
     if (segmentItem.id === candidate.id || segmentItem.state === 'ignored') return false;
-    const text = normalize(segmentItem.corrected || segmentItem.original);
+    const text = normalizeText(segmentItem.corrected || segmentItem.original);
     if (!candidateText || !text) return false;
     return text === candidateText || (Math.abs(segmentItem.startTime - candidate.startTime) < 12 && (text.includes(candidateText) || candidateText.includes(text)));
   });
+}
+
+/** 两个时间窗的重合比例（占较短窗口）。 */
+function overlapRatio(aStart: number, aEnd: number, bStart: number, bEnd: number): number {
+  const overlap = Math.min(aEnd, bEnd) - Math.max(aStart, bStart);
+  if (overlap <= 0) return 0;
+  return overlap / Math.max(1, Math.min(aEnd - aStart, bEnd - bStart));
+}
+
+/** 判断回传包与已有片段是否覆盖同一次发言：时间窗大幅重合，或起点接近且文本相似。 */
+function coversSameUtterance(segmentItem: CaptionSegment, packet: FeedPacket): boolean {
+  if (overlapRatio(segmentItem.startTime, segmentItem.endTime, packet.startTime, packet.endTime) >= 0.4) return true;
+  if (Math.abs(segmentItem.startTime - packet.startTime) > 3) return false;
+  const text = normalizeText(segmentItem.original);
+  const packetText = normalizeText(packet.text);
+  return !!text && !!packetText && (text === packetText || text.includes(packetText) || packetText.includes(text));
+}
+
+export type ReconcileOutcome = 'created' | 'merged' | 'absorbed' | 'protected' | 'skipped';
+
+/**
+ * 主备对账：回传包只提供线路、时间窗与原文。
+ * - 两路覆盖同一次发言时合并成一条；文本不同则并列待选。
+ * - 已确认的校对由本地确认记录决定，后到的线路内容只留对账记录，绝不覆盖。
+ * - 包 id 已入账时直接跳过，重试不会重复生成。
+ */
+export function reconcilePacket(model: DeskModel, packet: FeedPacket): { model: DeskModel; outcome: ReconcileOutcome; segmentId?: string } {
+  const already = model.segments.find((item) => item.packetIds.includes(packet.id));
+  if (already) return { model, outcome: 'skipped', segmentId: already.id };
+
+  const packetText = normalizeText(packet.text);
+  const match = model.segments.find((item) => item.state !== 'ignored' && coversSameUtterance(item, packet));
+
+  if (!match) {
+    const created: CaptionSegment = {
+      id: `seg-${packet.line}-${model.nextSequence}-${Date.now().toString(36)}`,
+      sequence: model.nextSequence,
+      startTime: packet.startTime,
+      endTime: packet.endTime,
+      receivedAt: Date.now(),
+      speaker: '未知发言人',
+      original: packet.text,
+      corrected: packet.text,
+      numberHints: '',
+      source: 'live',
+      line: packet.line,
+      state: 'pending',
+      revision: 0,
+      tags: [],
+      variants: [],
+      packetIds: [packet.id],
+    };
+    return {
+      model: { ...model, segments: [...model.segments, created], nextSequence: model.nextSequence + 1, updatedAt: Date.now() },
+      outcome: 'created',
+      segmentId: created.id,
+    };
+  }
+
+  const sameText = normalizeText(match.original) === packetText || normalizeText(match.corrected) === packetText;
+  const segments = model.segments.map((item): CaptionSegment => {
+    if (item.id !== match.id) return item;
+    const packetIds = [...item.packetIds, packet.id];
+    if (item.state === 'confirmed') {
+      // 本地确认记录优先：只登记对账结果，不改动已确认的文本。
+      return {
+        ...item,
+        packetIds,
+        variants: sameText ? item.variants : [...item.variants, { line: packet.line, text: packet.text, receivedAt: Date.now() }],
+        tags: [...new Set([...item.tags, '主备已对账'])],
+      };
+    }
+    if (sameText) {
+      return { ...item, packetIds, tags: [...new Set([...item.tags, '主备一致'])] };
+    }
+    const variants = [...item.variants];
+    if (!variants.some((variant) => normalizeText(variant.text) === packetText)) {
+      variants.push({ line: packet.line, text: packet.text, receivedAt: Date.now() });
+    }
+    return { ...item, packetIds, variants, tags: [...new Set([...item.tags, '主备待选'])] };
+  });
+
+  const outcome: ReconcileOutcome = match.state === 'confirmed' ? 'protected' : sameText ? 'absorbed' : 'merged';
+  return { model: { ...model, segments, updatedAt: Date.now() }, outcome, segmentId: match.id };
+}
+
+/** 备路回传包导入：失败保留检查点，重试从检查点续传且幂等。 */
+export function importBackhaul(model: DeskModel, pkg: BackhaulPackage, options: { interruptAfter?: number } = {}): DeskModel {
+  const checkpoint = model.backhaul && model.backhaul.packageId === pkg.id && model.backhaul.status === 'interrupted'
+    ? model.backhaul
+    : undefined;
+  let nextIndex = checkpoint?.nextIndex ?? 0;
+  let imported = checkpoint?.imported ?? 0;
+  let merged = checkpoint?.merged ?? 0;
+  let skipped = checkpoint?.skipped ?? 0;
+  let current: DeskModel = { ...model, backhaulPackage: pkg };
+  let processed = 0;
+
+  while (nextIndex < pkg.packets.length) {
+    if (options.interruptAfter !== undefined && processed >= options.interruptAfter) {
+      return {
+        ...current,
+        backhaul: {
+          packageId: pkg.id,
+          nextIndex,
+          total: pkg.packets.length,
+          imported,
+          merged,
+          skipped,
+          status: 'interrupted',
+          error: '备路回传链路中断，进度已保存到检查点',
+          updatedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      };
+    }
+    const result = reconcilePacket(current, pkg.packets[nextIndex]);
+    current = result.model;
+    if (result.outcome === 'created') imported += 1;
+    else if (result.outcome === 'skipped') skipped += 1;
+    else merged += 1;
+    nextIndex += 1;
+    processed += 1;
+  }
+
+  return {
+    ...current,
+    backhaul: { packageId: pkg.id, nextIndex, total: pkg.packets.length, imported, merged, skipped, status: 'done', updatedAt: Date.now() },
+    updatedAt: Date.now(),
+  };
+}
+
+/** 模拟备路回传包：覆盖最近几段发言（文本带线路差异），再补两条新发言。 */
+export function createBackhaulPackage(model: DeskModel): BackhaulPackage {
+  const packageId = `backhaul-${Date.now().toString(36)}`;
+  const backupVariantOf = (text: string): string => {
+    const varied = text
+      .replace(/5G/g, '五G')
+      .replace(/Co-Pilot/g, 'co pilot')
+      .replace(/Studio Cloud/g, 'studio cloud')
+      .replace(/，/g, ',')
+      .replace(/。$/, '');
+    return varied === text && text.endsWith('。') ? text.slice(0, -1) : varied;
+  };
+  const covered = [...model.segments]
+    .filter((item) => item.state !== 'ignored')
+    .sort((a, b) => b.startTime - a.startTime)
+    .slice(0, 3)
+    .reverse();
+  const packets: FeedPacket[] = covered.map((item, index) => ({
+    id: `${packageId}#${index}`,
+    line: 'backup',
+    startTime: item.startTime,
+    endTime: item.endTime,
+    text: backupVariantOf(item.original),
+  }));
+  const lastStart = Math.max(0, ...model.segments.map((item) => item.startTime));
+  const extras = ['备路回传补充一条现场提示,请核对术语表。', '导播确认下一段嘉宾发言即将开始。'];
+  extras.forEach((text, offset) => {
+    const start = lastStart + 9 * (offset + 1);
+    packets.push({ id: `${packageId}#${covered.length + offset}`, line: 'backup', startTime: start, endTime: start + 7, text });
+  });
+  return { id: packageId, createdAt: Date.now(), packets };
 }
 
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
@@ -226,40 +456,36 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const variants = model.segments.filter((item) => item.variants.length > 0 && item.state !== 'confirmed');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
-    backlog: pending.length + stale.length + duplicate.length + offline.length,
+    variants: variants.length,
+    // 重复片段不计入积压：主备对账后同一次发言只占一条。
+    backlog: pending.length + stale.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
 }
 
-export function createLiveSegment(sequence: number): CaptionSegment {
-  const speakers = ['主持人', '主讲人', '嘉宾 / 周然', '现场提问'];
-  const samples = [
-    '接下来请产品团队介绍新的工作流。',
-    '请注意屏幕右侧的实时队列状态。',
-    '在弱网环境下我们会保留未确认片段。',
-    '如果网络恢复,系统会按照时间顺序自动合并。',
-    '这段字幕包含二零二五年的项目数据。',
-    '大家可以在会后查看完整回放和术语表。',
-  ];
+const LIVE_SAMPLES = [
+  '接下来请产品团队介绍新的工作流。',
+  '请注意屏幕右侧的实时队列状态。',
+  '在弱网环境下我们会保留未确认片段。',
+  '如果网络恢复,系统会按照时间顺序自动合并。',
+  '这段字幕包含二零二五年的项目数据。',
+  '大家可以在会后查看完整回放和术语表。',
+];
+
+export function createLivePacket(sequence: number, line: FeedLine): FeedPacket {
   const start = Math.max(0, sequence * 9 - 10);
   return {
-    id: `seg-live-${sequence}-${Date.now().toString(36)}`,
-    sequence,
+    id: `live-${line}-${sequence}-${Date.now().toString(36)}`,
+    line,
     startTime: start,
-    receivedAt: Date.now(),
-    speaker: speakers[(sequence - 1) % speakers.length],
-    original: samples[(sequence - 1) % samples.length],
-    corrected: samples[(sequence - 1) % samples.length],
-    numberHints: '',
-    source: 'live',
-    state: 'pending',
-    revision: 0,
-    tags: [],
+    endTime: start + 7,
+    text: LIVE_SAMPLES[(sequence - 1) % LIVE_SAMPLES.length],
   };
 }
 
@@ -267,27 +493,50 @@ export function simulateLatency(model: DeskModel): DeskModel {
   if (model.connection === 'offline') return model;
   const step = model.connection === 'degraded' ? 0.7 : model.simulatedDelay > 2.8 ? -0.3 : 0.15;
   const delay = Math.max(0.7, Math.min(8.9, Number((model.simulatedDelay + step).toFixed(1))));
-  const applyStream = model.autoStream && Math.random() > 0.68;
-  let nextSequence = model.nextSequence;
-  let segments = model.segments;
-  if (applyStream) {
-    const candidate = createLiveSegment(model.nextSequence);
-    const duplicate = isDuplicate(candidate, segments);
-    segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复` } : candidate];
-    nextSequence += 1;
+  let connection = model.connection;
+  if (delay > 4.2) connection = 'degraded';
+  else if (connection === 'degraded' && delay < 3.4) connection = 'connected';
+
+  let next: DeskModel = { ...model, simulatedDelay: delay, connection };
+  if (model.autoStream && Math.random() > 0.68) {
+    if (connection === 'degraded') {
+      // 主路波动期间由备路供稿。
+      next = reconcilePacket(next, createLivePacket(next.nextSequence, 'backup')).model;
+    } else {
+      // 主路恢复后，同一次发言可能作为新片段补发回来，交给对账合并。
+      const redelivery = next.segments.find((item) => item.line === 'backup' && item.state !== 'ignored' && !item.packetIds.some((id) => id.includes('primary')));
+      if (redelivery && Math.random() > 0.4) {
+        next = reconcilePacket(next, {
+          id: `live-primary-re-${redelivery.id}-${Date.now().toString(36)}`,
+          line: 'primary',
+          startTime: redelivery.startTime,
+          endTime: redelivery.endTime,
+          text: normalizeNumbers(redelivery.original),
+        }).model;
+      } else {
+        next = reconcilePacket(next, createLivePacket(next.nextSequence, 'primary')).model;
+      }
+    }
   }
+
   const pendingCutoff = Date.now() - 90_000;
-  segments = segments.map((item) => item.state === 'pending' && item.receivedAt < pendingCutoff
-    ? { ...item, state: 'stale', staleReason: `片段已等待 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` }
+  const segments = next.segments.map((item) => item.state === 'pending' && item.receivedAt < pendingCutoff
+    ? { ...item, state: 'stale' as SegmentState, staleReason: `片段已等待 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` }
     : item);
-  return {
-    ...model,
-    segments,
-    nextSequence,
-    simulatedDelay: delay,
-    connection: delay > 4.2 ? 'degraded' : model.connection,
-    updatedAt: Date.now(),
-  };
+  return { ...next, segments, updatedAt: Date.now() };
+}
+
+/** 直播区与导出共用的已确认时间线：对账后仍残留的重复（如旧草稿）在这里去重。 */
+export function uniqueConfirmedSegments(model: DeskModel): CaptionSegment[] {
+  const confirmed = model.segments
+    .filter((item) => item.state === 'confirmed')
+    .sort((a, b) => a.startTime - b.startTime || a.sequence - b.sequence);
+  const kept: CaptionSegment[] = [];
+  for (const item of confirmed) {
+    if (isDuplicate(item, kept)) continue;
+    kept.push(item);
+  }
+  return kept;
 }
 
 export function toSrt(model: DeskModel): string {
@@ -298,9 +547,7 @@ export function toSrt(model: DeskModel): string {
     const millis = Math.round((seconds - Math.floor(seconds)) * 1000);
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}${separator}${String(millis).padStart(3, '0')}`;
   };
-  return model.segments
-    .filter((item) => item.state === 'confirmed')
-    .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+  return uniqueConfirmedSegments(model)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.endTime)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
 }

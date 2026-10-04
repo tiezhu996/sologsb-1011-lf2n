@@ -3,16 +3,21 @@ import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
   cloneModel,
+  createBackhaulPackage,
   createInitialModel,
+  importBackhaul,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
   queueStats,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  uniqueConfirmedSegments,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type FeedLine,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -43,6 +48,10 @@ function stateLabel(state: SegmentState): string {
 
 function connectionLabel(state: ConnectionState): string {
   return { connected: '连接稳定', degraded: '延迟波动', offline: '离线校正' }[state];
+}
+
+function lineLabel(line: FeedLine): string {
+  return line === 'primary' ? '主路' : '备路';
 }
 
 @customElement('caption-desk')
@@ -175,6 +184,22 @@ export class CaptionDesk extends LitElement {
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
 
+    .line-tag { display: inline-block; padding: 1px 5px; margin-left: 6px; border: 1px solid #0f62fe; color: #0f62fe; font-size: 9px; line-height: 1.4; vertical-align: 1px; }
+    .line-tag.backup { border-color: #08bdba; color: #007d79; }
+    .variant-hint { color: #6929c4; }
+
+    .variant-box { border: 1px solid #d0e2ff; background: #edf5ff; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+    .variant-head { margin: 0; color: #0043ce; font-size: 10px; font-weight: 600; line-height: 1.5; }
+    .variant-item { background: var(--cds-layer, #fff); border-left: 3px solid #78a9ff; padding: 8px 10px; }
+    .variant-item.current { border-left-color: #42be65; }
+    .variant-item > span { color: var(--cds-text-secondary, #525252); font: 500 9px/1 "IBM Plex Mono", monospace; }
+    .variant-item p { margin: 5px 0 7px; font-size: calc(var(--caption-font-size) * .9); line-height: 1.45; }
+
+    .backhaul-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 9px; }
+    .backhaul-status { padding: 8px 9px; background: #fff8e1; border-left: 3px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.5; }
+    .backhaul-status.done { background: #defbe6; border-left-color: #42be65; color: #044317; }
+    .backhaul-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
     .empty p { margin: 0; font-size: 11px; line-height: 1.5; }
@@ -273,7 +298,8 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        // 旧草稿没有线路信息，按主路兼容打开。
+        if (parsed.segments?.length) return migrateModel(parsed);
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -477,6 +503,50 @@ export class CaptionDesk extends LitElement {
     }));
   }
 
+  private adoptVariant(index: number): void {
+    const selected = this.selected;
+    const variant = selected?.variants[index];
+    if (!selected || !variant) return;
+    this.commit(`采用${lineLabel(variant.line)}版本`, (current) => ({
+      ...current,
+      segments: current.segments.map((item) => item.id === selected.id ? {
+        ...item,
+        corrected: variant.text,
+        line: variant.line,
+        variants: item.variants.filter((_, itemIndex) => itemIndex !== index),
+        tags: [...new Set([...item.tags, `采用${lineLabel(variant.line)}文本`])],
+        revision: item.revision + 1,
+      } : item),
+    }));
+  }
+
+  private applyBackhaul(next: DeskModel, label: string): void {
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = next;
+    this.persist();
+    const checkpoint = next.backhaul;
+    if (!checkpoint) return;
+    this.pushToast(
+      checkpoint.status === 'interrupted' ? 'warning' : 'success',
+      label,
+      `检查点 ${checkpoint.nextIndex}/${checkpoint.total} · 新建 ${checkpoint.imported} 段 · 合并 ${checkpoint.merged} 段 · 跳过 ${checkpoint.skipped} 段`,
+    );
+  }
+
+  private importBackhaulPackage(): void {
+    const pkg = createBackhaulPackage(this.model);
+    // 首次导入模拟链路中断：处理到一半时断开，进度写入检查点。
+    const interruptAfter = Math.max(1, Math.floor(pkg.packets.length / 2));
+    this.applyBackhaul(importBackhaul(this.model, pkg, { interruptAfter }), '回传包导入中断，已保存检查点');
+  }
+
+  private retryBackhaul(): void {
+    const pkg = this.model.backhaulPackage;
+    if (!pkg || this.model.backhaul?.status !== 'interrupted') return;
+    this.applyBackhaul(importBackhaul(this.model, pkg), '从检查点恢复导入，重试未重复生成');
+  }
+
   private setConnection(connection: ConnectionState): void {
     this.commit(connection === 'offline' ? '切换到离线校正' : connection === 'degraded' ? '模拟延迟波动' : '连接已恢复', (current) => ({
       ...current,
@@ -604,7 +674,7 @@ export class CaptionDesk extends LitElement {
         ${segments.map((item) => html`
           <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
-              <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
+              <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}<span class="line-tag ${item.line}">${lineLabel(item.line)}</span></span>
               <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
             </div>
             <p class="segment-text">${item.original}</p>
@@ -614,6 +684,7 @@ export class CaptionDesk extends LitElement {
               <span>·</span>
               <span>${formatAge(item.receivedAt)}</span>
               ${item.revision > 0 ? html`<span>· <b>修改 ${item.revision} 次</b></span>` : nothing}
+              ${item.variants.length ? html`<span>· <b class="variant-hint">${item.variants.length + 1} 个版本待选</b></span>` : nothing}
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
@@ -638,6 +709,7 @@ export class CaptionDesk extends LitElement {
               <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
+              <cds-tag type=${item.line === 'backup' ? 'teal' : 'blue'} size="sm">${lineLabel(item.line)}</cds-tag>
               <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
               <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
             </div>
@@ -650,6 +722,22 @@ export class CaptionDesk extends LitElement {
             ` : nothing}
             ${item.state === 'stale' ? html`
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
+            ` : nothing}
+            ${item.variants.length ? html`
+              <div class="variant-box">
+                <p class="variant-head">主备对账：两路覆盖同一次发言，已合并为一条，${item.variants.length + 1} 个版本并列待选。${item.state === 'confirmed' ? '已确认的校对以本地确认记录为准，后到的线路内容不会覆盖。' : '确认时以当前文本为准，或先采用另一路版本。'}</p>
+                <div class="variant-item current">
+                  <span>当前采用 · ${lineLabel(item.line)}</span>
+                  <p>${item.corrected}</p>
+                </div>
+                ${item.variants.map((variant, index) => html`
+                  <div class="variant-item">
+                    <span>${lineLabel(variant.line)} · 到达于 ${formatAge(variant.receivedAt)}</span>
+                    <p>${variant.text}</p>
+                    ${item.state !== 'confirmed' ? html`<cds-button kind="tertiary" size="sm" @click=${() => this.adoptVariant(index)}>采用此版本</cds-button>` : nothing}
+                  </div>
+                `)}
+              </div>
             ` : nothing}
             <div class="form-grid">
               <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
@@ -695,9 +783,29 @@ export class CaptionDesk extends LitElement {
 
   private renderInspector() {
     const item = this.selected;
-    const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const confirmed = uniqueConfirmedSegments(this.model);
+    const checkpoint = this.model.backhaul;
     return html`
       <div class="inspector">
+        <section class="inspector-section">
+          <div class="inspector-section-head">
+            <h3>备路回传对账</h3>
+            <span>${checkpoint ? (checkpoint.status === 'done' ? '导入完成' : '导入中断') : '待导入'}</span>
+          </div>
+          <div class="backhaul-body">
+            ${checkpoint ? html`
+              <div class="backhaul-status ${checkpoint.status}">
+                检查点 ${checkpoint.nextIndex}/${checkpoint.total} · 新建 ${checkpoint.imported} · 合并 ${checkpoint.merged} · 跳过 ${checkpoint.skipped}
+                ${checkpoint.error ? html`<br />${checkpoint.error}` : nothing}
+              </div>
+            ` : html`<div class="backhaul-status done">回传包按检查点导入；中断后重试从断点续传，不会重复生成片段。</div>`}
+            <div class="backhaul-actions">
+              <cds-button kind="secondary" size="sm" @click=${this.importBackhaulPackage}>模拟备路回传包</cds-button>
+              ${checkpoint?.status === 'interrupted' ? html`<cds-button kind="primary" size="sm" @click=${this.retryBackhaul}>从检查点重试</cds-button>` : nothing}
+            </div>
+          </div>
+        </section>
+
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
@@ -737,9 +845,10 @@ export class CaptionDesk extends LitElement {
           <div class="live-timeline">
             ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
               <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
+                <time>${formatClock(segment.startTime)} · ${segment.speaker} · ${lineLabel(segment.line)}</time>
                 <p>${segment.corrected}</p>
                 ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                ${segment.variants.length ? html`<small>主备已对账 · 采用本地确认版本</small>` : nothing}
               </article>
             `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
@@ -780,7 +889,7 @@ export class CaptionDesk extends LitElement {
             <span class="connection-dot"></span>
             <div class="connection-copy">
               <strong>${connectionLabel(this.model.connection)} · ${this.model.simulatedDelay.toFixed(1)} 秒延迟</strong>
-              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
+              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : this.model.connection === 'degraded' ? '主路波动，备路供稿中，恢复后自动对账合并' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
             </div>
           </div>
           <div class="header-actions">
@@ -794,7 +903,7 @@ export class CaptionDesk extends LitElement {
         <section class="status-strip">
           <div class="status-cell hero">
             <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline} · 待选版本 ${stats.variants}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
@@ -844,7 +953,12 @@ export class CaptionDesk extends LitElement {
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
-                : html`<cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟断线</cds-button>`}
+                : html`
+                  ${this.model.connection === 'degraded'
+                    ? html`<cds-button kind="tertiary" size="sm" @click=${() => this.setConnection('connected')}>恢复主路</cds-button>`
+                    : html`<cds-button kind="tertiary" size="sm" @click=${() => this.setConnection('degraded')}>模拟主路波动</cds-button>`}
+                  <cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟断线</cds-button>
+                `}
             </div>
             <div class="column-body">${this.renderInspector()}</div>
           </section>
